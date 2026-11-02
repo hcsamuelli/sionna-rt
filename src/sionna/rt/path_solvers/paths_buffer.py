@@ -11,7 +11,7 @@ import dataclasses
 
 from sionna.rt.constants import InteractionType, INVALID_SHAPE,\
     INVALID_PRIMITIVE
-from sionna.rt.utils import WedgeGeometry
+from sionna.rt.utils import WedgeGeometry, hash_fnv1a
 
 
 class PathsBufferBase:
@@ -654,6 +654,125 @@ class PathsBuffer(PathsBufferBase):
         self._paths_counter = num_paths
         self._tensor_width_lit = dr.width(self._shapes.array)
         self._tensor_width = dr.opaque(mi.UInt32, self._tensor_width_lit)
+
+    def discard_duplicates(self) -> None:
+        r"""
+        Marks copies of the same path as invalid
+
+        Two paths are copies if they have the same source, target, and
+        sequence of interactions: at every depth the same interaction type and
+        shape, plus the same primitive at specular reflections and the same
+        edge at diffractions. Of each set of copies, the path with the lowest
+        buffer index is kept. Paths with a diffuse reflection are never
+        marked. :meth:`~sionna.rt.PathsBuffer.discard_invalid` drops the
+        marked paths.
+        """
+        num_paths = self._buffer_size
+        depth_dim_size = self._depth_dim_size
+        if num_paths == 0:
+            return
+
+        # Evaluate the buffer, so that computed quantities are not re-evaluated
+        self.schedule()
+        dr.eval()
+        interaction_types = self._interaction_types.array
+        interaction_shapes = self._shapes.array
+        interaction_primitives = self._primitives.array
+
+        # Paths to check: valid ones without a diffuse reflection
+        all_path_indices = dr.arange(mi.UInt, num_paths)
+        has_diffuse = dr.zeros(mi.Bool, num_paths)
+        for depth in range(depth_dim_size):
+            interaction_type = dr.gather(
+                mi.UInt, interaction_types,
+                all_path_indices*depth_dim_size + depth)
+            has_diffuse |= interaction_type == InteractionType.DIFFUSE
+        checked_indices = dr.compress(self._valid & ~has_diffuse)
+        num_checked_paths = dr.width(checked_indices)
+        if num_checked_paths < 2:
+            return
+
+        def build_path_keys(path_indices):
+            """Key columns of the paths at `path_indices`, left unevaluated"""
+            key_columns = [dr.gather(mi.UInt, self._src_indices, path_indices),
+                           dr.gather(mi.UInt, self._tgt_indices, path_indices)]
+            is_diffracting = dr.zeros(mi.Bool, dr.width(path_indices))
+            for depth in range(depth_dim_size):
+                flat_indices = path_indices*depth_dim_size + depth
+                interaction_type = dr.gather(mi.UInt, interaction_types,
+                                             flat_indices)
+                shape = dr.gather(mi.UInt, interaction_shapes, flat_indices)
+                primitive = dr.gather(mi.UInt, interaction_primitives,
+                                      flat_indices)
+                is_diffracting |= \
+                    interaction_type == InteractionType.DIFFRACTION
+                key_columns += [interaction_type, shape,
+                                dr.select(interaction_type
+                                          == InteractionType.SPECULAR,
+                                          primitive, INVALID_PRIMITIVE)]
+            if not self._diffraction:
+                return key_columns
+
+            # The diffracting edge (at most one per path): its two faces, and
+            # its two vertices, as the faces of a two-sided panel share all
+            # three edges
+            wedges = dr.gather(WedgeGeometry, self._diffracting_wedges,
+                               path_indices)
+            lower_face = dr.minimum(wedges.prim0, wedges.primn)
+            upper_face = dr.select(wedges.prim0 == wedges.primn,
+                                   0x80000000 | wedges.local_edge,  # a screen
+                                   dr.maximum(wedges.prim0, wedges.primn))
+
+            # `local_edge` refers to `prim0` or, after a face swap, `primn`:
+            # take the edge whose end points lie on the wedge's edge line
+            def measure_distance_off_edge_line(edge_vertex_indices):
+                start = wedges.shape.vertex_position(edge_vertex_indices.x,
+                                                     is_diffracting)
+                end = wedges.shape.vertex_position(edge_vertex_indices.y,
+                                                   is_diffracting)
+                return dr.norm(dr.cross(start - wedges.o, wedges.e_hat))\
+                    + dr.norm(dr.cross(end - wedges.o, wedges.e_hat))
+            edge_on_prim0 = wedges.shape.edge_indices(wedges.prim0,
+                                                      wedges.local_edge,
+                                                      is_diffracting)
+            edge_on_primn = wedges.shape.edge_indices(wedges.primn,
+                                                      wedges.local_edge,
+                                                      is_diffracting)
+            edge_vertex_indices = dr.select(
+                measure_distance_off_edge_line(edge_on_prim0)
+                <= measure_distance_off_edge_line(edge_on_primn),
+                edge_on_prim0, edge_on_primn)
+            edge_columns = (lower_face, upper_face,
+                            dr.minimum(edge_vertex_indices.x,
+                                       edge_vertex_indices.y),
+                            dr.maximum(edge_vertex_indices.x,
+                                       edge_vertex_indices.y))
+            return key_columns + [dr.select(is_diffracting, column,
+                                            INVALID_PRIMITIVE)
+                                  for column in edge_columns]
+
+        # Sort the checked paths by key hash; the sort is stable, so the
+        # copies of a path come after its lowest buffer index
+        first_column, *other_columns = build_path_keys(checked_indices)
+        key_hashes = hash_fnv1a(first_column)
+        for key_column in other_columns:
+            key_hashes = hash_fnv1a(key_column, h=key_hashes)
+        sorted_order = dr.argsort(key_hashes)
+        sorted_positions = dr.arange(mi.UInt, num_checked_paths)
+        previous_positions = dr.gather(mi.UInt, sorted_order,
+                                       dr.maximum(sorted_positions, 1) - 1)
+        sorted_path_indices = dr.gather(mi.UInt, checked_indices, sorted_order)
+        previous_path_indices = dr.gather(mi.UInt, checked_indices,
+                                          previous_positions)
+
+        # Compare the whole key with the previous path, so that a hash
+        # collision never drops a path
+        is_copy = sorted_positions > 0
+        for sorted_column, previous_column in zip(
+                build_path_keys(sorted_path_indices),
+                build_path_keys(previous_path_indices)):
+            is_copy &= sorted_column == previous_column
+        dr.scatter(self._valid, False, sorted_path_indices, active=is_copy)
 
     def discard_invalid(self) -> None:
         r"""
