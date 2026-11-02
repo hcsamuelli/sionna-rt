@@ -66,6 +66,10 @@ class PathSolver:
     when the ``seed`` parameter is fixed. Only when setting the
     ``deterministic`` argument to ``True`` are results deterministic.
 
+    Copies of the same path are dropped by default (see
+    ``discard_duplicate_paths``). They still occupy slots of
+    ``max_num_paths_per_src``, as they are removed at the end.
+
     Example
     -------
     .. code-block:: python
@@ -119,14 +123,21 @@ class PathSolver:
         :align: center
     """
 
-    def __init__(self, deterministic: bool = False):
+    def __init__(self, deterministic: bool = False, *,
+                 discard_duplicate_paths: bool = True):
         """
         Instantiates the path solver.
 
         :param deterministic: Enable deterministic path generation. There should
                               be little to no effect on latency, however memory
                               usage will be increased.
+        :param discard_duplicate_paths: Drop copies of the same path, i.e.,
+            paths with the same source, target, and sequence of interactions.
+            Paths with a diffuse reflection are never dropped. Set to ``False``
+            to get the output of earlier versions.
         """
+
+        self._discard_duplicate_paths = discard_duplicate_paths
 
         # Instantiate the Candidate Generator
         if deterministic:
@@ -307,7 +318,9 @@ class PathSolver:
             tgt_antenna_patterns=tgt_antenna_patterns,
         )
 
-        # Discard invalid paths
+        # Discard copies of the same path, then invalid paths
+        if self._discard_duplicate_paths:
+            paths_buffer.discard_duplicates()
         paths_buffer.discard_invalid()
 
         # Build the path object
