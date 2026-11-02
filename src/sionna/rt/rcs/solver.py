@@ -331,7 +331,10 @@ class RCSSolver:
             src_boxes=spst_boxes,
         )
 
-        # Discard invalid paths
+        # Discard copies of the same leg, then invalid paths: pairing k copies
+        # of a transmitter leg with m copies of a receiver leg would give k*m
+        # copies of one path
+        paths_buffer.discard_duplicates()
         paths_buffer.discard_invalid()
 
         # Split the paths buffer into the legs that connect the transmitters to
